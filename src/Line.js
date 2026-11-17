@@ -1,9 +1,7 @@
-import line from 'd3-shape/src/line';
-import { monotoneX } from 'd3-shape/src/curve/monotone';
-import select from 'd3-selection/src/select';
-import mouse from 'd3-selection/src/mouse';
 import { point as scalePoint } from 'd3-scale/src/band';
 import scaleLinear from 'd3-scale/src/linear';
+import select from 'd3-selection/src/select';
+import mouse from 'd3-selection/src/mouse';
 
 import addAxis from './utils/addAxis';
 import addLabels from './utils/addLabels';
@@ -13,10 +11,8 @@ import addFont from './utils/addFont';
 import addFilter from './utils/addFilter';
 import colors from './utils/colors';
 import config from './config';
-
-const margin = {
-  top: 50, right: 30, bottom: 50, left: 50,
-};
+import { normalizeLineData, computeYDomain } from './utils/lineData';
+import { buildLineAttributes } from './utils/lineAttributes';
 
 class Line {
   constructor(svg, {
@@ -33,6 +29,10 @@ class Line {
       showLegend: true,
       ...options,
     };
+
+    const margin = {
+      top: 50, right: 30, bottom: 50, left: 50,
+    };
     if (title) {
       this.title = title;
       margin.top = 60;
@@ -45,10 +45,12 @@ class Line {
       this.yLabel = yLabel;
       margin.left = 70;
     }
-    this.data = {
-      labels,
-      datasets,
-    };
+    this.margin = margin;
+
+    // layer 1: normalize raw input (dedupe x labels, align datasets,
+    // turn holes into null) before anything is computed from it
+    this.data = normalizeLineData(labels, datasets);
+
     this.filter = 'url(#xkcdify)';
     this.fontFamily = this.options.fontFamily || 'xkcd';
     if (this.options.unxkcdify) {
@@ -76,6 +78,7 @@ class Line {
   }
 
   render() {
+    const margin = this.margin;
     if (this.title) addLabels.title(this.svgEl, this.title, this.options.strokeColor);
     if (this.xLabel) addLabels.xLabel(this.svgEl, this.xLabel, this.options.strokeColor);
     if (this.yLabel) addLabels.yLabel(this.svgEl, this.yLabel, this.options.strokeColor);
@@ -93,11 +96,8 @@ class Line {
       .domain(this.data.labels)
       .range([0, this.width]);
 
-    const allData = this.data.datasets
-      .reduce((pre, cur) => pre.concat(cur.data), []);
-
     const yScale = scaleLinear()
-      .domain([Math.min(...allData), Math.max(...allData)])
+      .domain(computeYDomain(this.data.datasets))
       .range([this.height, 0]);
 
     const graphPart = this.chart.append('g')
@@ -123,19 +123,35 @@ class Line {
     this.svgEl.selectAll('.domain')
       .attr('filter', this.filter);
 
-    const theLine = line()
-      .x((d, i) => xScale(this.data.labels[i]))
-      .y((d) => yScale(d))
-      .curve(monotoneX);
+    // layer 2 + 3: split datasets into segments, interpolate each
+    // segment, and map the result to SVG attributes (pure, DOM-free)
+    const geometry = buildLineAttributes(this.data.datasets, {
+      xPositions: this.data.labels.map((label) => xScale(label)),
+      yScale,
+      dataColors: this.options.dataColors,
+    });
 
     graphPart.selectAll('.xkcd-chart-line')
-      .data(this.data.datasets)
+      .data(geometry.paths)
       .enter()
       .append('path')
       .attr('class', 'xkcd-chart-line')
-      .attr('d', (d) => theLine(d.data))
-      .attr('fill', 'none')
-      .attr('stroke', (d, i) => this.options.dataColors[i])
+      .attr('d', (d) => d.d)
+      .attr('fill', (d) => d.fill)
+      .attr('stroke', (d) => d.stroke)
+      .attr('filter', this.filter);
+
+    // isolated single points cannot be interpolated; draw them as dots
+    graphPart.selectAll('.xkcd-chart-dot')
+      .data(geometry.dots)
+      .enter()
+      .append('circle')
+      .attr('class', 'xkcd-chart-dot')
+      .attr('cx', (d) => d.cx)
+      .attr('cy', (d) => d.cy)
+      .attr('r', (d) => d.r)
+      .attr('stroke', (d) => d.stroke)
+      .attr('fill', (d) => d.fill)
       .attr('filter', this.filter);
 
     // hover effect
@@ -151,8 +167,8 @@ class Line {
 
     const circles = this.data.datasets.map((dataset, i) => graphPart
       .append('circle')
-      .style('stroke', this.options.dataColors[i])
-      .style('fill', this.options.dataColors[i])
+      .style('stroke', this.options.dataColors[i % this.options.dataColors.length])
+      .style('fill', this.options.dataColors[i % this.options.dataColors.length])
       .attr('r', 3.5)
       .style('visibility', 'hidden'));
 
@@ -186,14 +202,19 @@ class Line {
           .attr('x2', xScale(this.data.labels[mostNearLabelIndex]));
 
         this.data.datasets.forEach((dataset, j) => {
+          const value = dataset.data[mostNearLabelIndex];
+          if (value === null || value === undefined) {
+            circles[j].style('visibility', 'hidden');
+            return;
+          }
           circles[j]
             .style('visibility', 'visible')
             .attr('cx', xScale(this.data.labels[mostNearLabelIndex]))
-            .attr('cy', yScale(dataset.data[mostNearLabelIndex]));
+            .attr('cy', yScale(value));
         });
 
         const tooltipItems = this.data.datasets.map((dataset, j) => ({
-          color: this.options.dataColors[j],
+          color: this.options.dataColors[j % this.options.dataColors.length],
           text: `${this.data.datasets[j].label || ''}: ${this.data.datasets[j].data[mostNearLabelIndex]}`,
         }));
 
@@ -221,7 +242,7 @@ class Line {
     if (this.options.showLegend) {
       const legendItems = this.data.datasets
         .map((dataset, i) => ({
-          color: this.options.dataColors[i],
+          color: this.options.dataColors[i % this.options.dataColors.length],
           text: dataset.label,
         }));
 
